@@ -1,0 +1,17 @@
+---
+# Role defaults. group_vars/all.yml takes precedence over these (Ansible
+# variable precedence: role defaults are the lowest tier). These are here so
+# the role works standalone if extracted.
+
+operation_mode: idle_check
+dry_run: false
+notify_only: false
+
+idle_window_minutes: 60
+idle_cpu_threshold_percent: 5.0
+idle_network_threshold_bytes: 1048576
+check_disk_io: false
+idle_disk_io_threshold_bytes: 10485760
+idle_min_uptime_minutes: 30
+
+action_taken: none

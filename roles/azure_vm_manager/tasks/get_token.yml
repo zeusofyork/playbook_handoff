@@ -1,0 +1,65 @@
+---
+# Caches a bearer token on localhost for the duration of the play. The Azure
+# Monitor module isn't shipped in azcollection, so we hit the REST API
+# directly. AAD tokens are valid for ~1h, comfortably longer than any sane
+# play runtime.
+
+- name: Acquire ARM token via Service Principal
+  ansible.builtin.uri:
+    url: "https://login.microsoftonline.com/{{ azure_tenant_id }}/oauth2/v2.0/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      client_id:     "{{ azure_client_id }}"
+      client_secret: "{{ azure_client_secret }}"
+      scope:         "https://management.azure.com/.default"
+      grant_type:    "client_credentials"
+    status_code: 200
+    return_content: true
+  register: aad_sp_token
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+  when:
+    - azure_client_secret | default('') | length > 0
+    - azure_client_id     | default('') | length > 0
+    - azure_tenant_id     | default('') | length > 0
+
+- name: Acquire ARM token via Managed Identity (fallback)
+  ansible.builtin.uri:
+    url: >-
+      http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/
+    method: GET
+    headers:
+      Metadata: "true"
+    status_code: 200
+    return_content: true
+    timeout: 5
+  register: aad_msi_token
+  delegate_to: localhost
+  run_once: true
+  no_log: true
+  when: azure_client_secret | default('') | length == 0
+  ignore_errors: true
+
+- name: Set bearer token fact
+  ansible.builtin.set_fact:
+    azure_bearer_token: >-
+      {{
+        aad_sp_token.json.access_token
+          if (azure_client_secret | default('') | length > 0)
+          else aad_msi_token.json.access_token
+      }}
+  run_once: true
+  no_log: true
+
+- name: Sanity-check token
+  ansible.builtin.assert:
+    that:
+      - azure_bearer_token is defined
+      - azure_bearer_token | length > 100
+    fail_msg: >-
+      Could not acquire an Azure ARM bearer token. Check AAP credential
+      injection (AZURE_TENANT / AZURE_CLIENT_ID / AZURE_SECRET) or that the
+      controller has a Managed Identity with Reader+Monitoring Reader.
+  run_once: true

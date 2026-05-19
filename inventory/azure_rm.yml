@@ -1,0 +1,41 @@
+---
+# Dynamic inventory for Azure VMs.
+# Resolution order for credentials (auth_source: auto):
+#   1) Managed identity (if controller runs in Azure)
+#   2) Env vars: AZURE_SUBSCRIPTION_ID, AZURE_TENANT, AZURE_CLIENT_ID, AZURE_SECRET
+#   3) ~/.azure/credentials
+# In AAP, attach the "Microsoft Azure Resource Manager" credential to the job
+# template and these env vars are injected for you.
+
+plugin: azure.azcollection.azure_rm
+auth_source: auto
+
+# Include every RG. Restrict here if your subscription is mixed-tenant.
+include_vm_resource_groups:
+  - "*"
+
+# Surface the fields we need as hostvars.
+hostvar_expressions:
+  power_state: powerstate                  # 'running', 'deallocated', 'stopped', etc.
+  vm_size:    virtual_machine_size_id
+  os_type:    os_profile.os_type | default('linux')
+  rg_name:    resource_group
+  vm_id:      id
+
+# Keyed groups let you target by tag in a job template:
+#   target_hosts: tag_AutoStop_true
+keyed_groups:
+  - prefix: tag
+    key: tags
+  - prefix: rg
+    key: resource_group | lower
+  - prefix: location
+    key: location
+  - prefix: power
+    key: powerstate
+
+fail_on_template_errors: false
+
+# We don't SSH to these VMs from this playbook, every task runs on localhost
+# and hits the ARM API. So plain_host_names + no ansible_host is fine.
+plain_host_names: true

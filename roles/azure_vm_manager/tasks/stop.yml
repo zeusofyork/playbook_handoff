@@ -1,0 +1,37 @@
+---
+# IMPORTANT: deallocated != stopped.
+#   "stopped"     = guest OS shut down, compute still reserved, BILLING CONTINUES
+#   "deallocated" = compute released, billing for the VM stops (disks still bill)
+# This task always deallocates. If you genuinely need a guest-only shutdown
+# (rare, usually for an inside-VM action), set allocated:true started:false.
+
+- name: "[stop] Already deallocated, no-op"
+  ansible.builtin.set_fact:
+    action_taken: "skipped_already_deallocated"
+  when: vm_power_state == 'deallocated'
+
+- name: "[stop] Deallocate VM"
+  azure.azcollection.azure_rm_virtualmachine:
+    resource_group: "{{ resource_group }}"
+    name: "{{ vm_name }}"
+    allocated: false
+    started: false
+  delegate_to: localhost
+  when: vm_power_state != 'deallocated'
+  check_mode: "{{ dry_run | bool }}"
+  register: stop_result
+  retries: 3
+  delay: 15
+  until: stop_result is succeeded
+
+- name: "[stop] Record action"
+  ansible.builtin.set_fact:
+    action_taken: "{{ 'deallocated' if vm_power_state != 'deallocated' else action_taken }}"
+
+- name: "[stop] Notify"
+  ansible.builtin.include_tasks: notify.yml
+  vars:
+    notify_event: "deallocated"
+  when:
+    - notify_webhook_url | default('') | length > 0
+    - action_taken == 'deallocated'

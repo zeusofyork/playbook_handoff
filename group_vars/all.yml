@@ -1,0 +1,52 @@
+---
+# Operation mode. Required. One of: start | stop | idle_check
+operation_mode: idle_check
+
+# Optional: limit run to a host pattern (group from inventory or literal name)
+target_hosts: all
+
+# Tag schema for opt-in / opt-out.
+# Only VMs carrying {{ autostop_tag_key }}={{ autostop_tag_value }} are touched.
+# Leave autostop_tag_key empty to operate on every VM in target_hosts.
+autostop_tag_key: "AutoStop"
+autostop_tag_value: "true"
+
+# Hard opt-out. Any VM with this tag (any value) is skipped unconditionally.
+# Safety hatch for prod boxes someone tagged AutoStop by mistake.
+exclusion_tag_key: "AutoStopExclude"
+
+# Idle-detection thresholds (only relevant for operation_mode: idle_check).
+#
+# Look-back window. Azure Monitor stores 1-min metrics for ~30 days at PT1M
+# granularity. Below 5 min you get rate-limited fast.
+idle_window_minutes: 60
+
+# CPU avg (Percentage CPU aggregation=Average) over the window
+idle_cpu_threshold_percent: 5.0
+
+# Network In Total + Network Out Total (aggregation=Total) over the window.
+# 1 MiB catches kernel/agent heartbeat noise but flags real activity.
+idle_network_threshold_bytes: 1048576
+
+# Optional disk IO gate. Costs an extra metrics call. Useful for build agents
+# and DB servers where CPU can be near-zero but disk is hot.
+check_disk_io: false
+idle_disk_io_threshold_bytes: 10485760    # 10 MiB
+
+# Minimum uptime guard: don't dealloc a VM that came up recently, even if it
+# looks idle. Prevents flapping during long boot/cloud-init runs.
+idle_min_uptime_minutes: 30
+
+# Safety / behavior flags
+dry_run: false           # check_mode for the dealloc/alloc call
+notify_only: false       # idle_check evaluates but never deallocates
+parallel_forks: 25       # serial value on the play
+
+# Webhook for notifications (Slack incoming webhook, Teams, etc.). Empty = off.
+notify_webhook_url: ""
+
+# Azure auth. Populated by AAP credential or env vars. Don't hard-code.
+azure_subscription_id: "{{ lookup('env', 'AZURE_SUBSCRIPTION_ID') | default('', true) }}"
+azure_tenant_id:       "{{ lookup('env', 'AZURE_TENANT')          | default('', true) }}"
+azure_client_id:       "{{ lookup('env', 'AZURE_CLIENT_ID')       | default('', true) }}"
+azure_client_secret:   "{{ lookup('env', 'AZURE_SECRET')          | default('', true) }}"

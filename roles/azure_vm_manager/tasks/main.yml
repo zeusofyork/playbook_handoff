@@ -1,0 +1,25 @@
+---
+# Resolve the VM in ARM. Inventory hostvars give us name/resource_group already,
+# but we re-query so we have an authoritative current power_state and the
+# canonical resource ID for metric calls.
+- name: Look up current VM state
+  azure.azcollection.azure_rm_virtualmachine_info:
+    resource_group: "{{ resource_group }}"
+    name: "{{ name | default(inventory_hostname) }}"
+  delegate_to: localhost
+  register: vm_info
+
+- name: Fail clearly when the VM is gone
+  ansible.builtin.fail:
+    msg: "VM {{ inventory_hostname }} not found in RG {{ resource_group }}"
+  when: (vm_info.vms | default([])) | length == 0
+
+- name: Set canonical VM facts
+  ansible.builtin.set_fact:
+    vm_resource_id: "{{ vm_info.vms[0].id }}"
+    vm_power_state: "{{ vm_info.vms[0].power_state | default('unknown') }}"
+    vm_name:        "{{ vm_info.vms[0].name }}"
+    vm_location:    "{{ vm_info.vms[0].location }}"
+
+- name: Dispatch to operation handler
+  ansible.builtin.include_tasks: "{{ operation_mode }}.yml"

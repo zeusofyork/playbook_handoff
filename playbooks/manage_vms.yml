@@ -1,0 +1,69 @@
+---
+# Azure VM lifecycle manager.
+#
+# Modes:
+#   operation_mode=start       allocate + power on
+#   operation_mode=stop        deallocate (releases compute, kills billing)
+#   operation_mode=idle_check  query Azure Monitor, deallocate if idle
+#
+# Examples:
+#   # Stop everything tagged AutoStop=true (cron / AAP schedule):
+#   ansible-playbook playbooks/manage_vms.yml -e operation_mode=stop
+#
+#   # Start one VM on demand:
+#   ansible-playbook playbooks/manage_vms.yml \
+#      -e operation_mode=start -e target_hosts=jumphost-prod-01
+#
+#   # Idle sweep every 30 min via AAP schedule:
+#   ansible-playbook playbooks/manage_vms.yml -e operation_mode=idle_check
+#
+#   # Audit-only (no state change). Handy first run.
+#   ansible-playbook playbooks/manage_vms.yml \
+#      -e operation_mode=idle_check -e notify_only=true
+
+- name: Azure VM lifecycle management
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: "{{ parallel_forks | default(25) }}"
+  any_errors_fatal: false
+
+  pre_tasks:
+    - name: Validate operation_mode
+      ansible.builtin.assert:
+        that:
+          - operation_mode in ['start', 'stop', 'idle_check']
+        fail_msg: >-
+          operation_mode='{{ operation_mode | default('<undef>') }}' is invalid.
+          Must be one of: start, stop, idle_check.
+      run_once: true
+      delegate_to: localhost
+
+    - name: Skip VMs carrying the hard-exclusion tag
+      ansible.builtin.meta: end_host
+      when:
+        - exclusion_tag_key | default('') | length > 0
+        - exclusion_tag_key in (tags | default({}))
+
+    - name: Skip VMs not opted-in via AutoStop tag
+      ansible.builtin.meta: end_host
+      when:
+        - autostop_tag_key | default('') | length > 0
+        - (tags | default({})).get(autostop_tag_key, '') | lower
+            != (autostop_tag_value | lower)
+
+  roles:
+    - role: azure_vm_manager
+
+  post_tasks:
+    - name: Per-host action summary
+      ansible.builtin.debug:
+        msg: >-
+          [{{ operation_mode }}] {{ inventory_hostname }}
+          rg={{ rg_name | default(resource_group | default('?')) }}
+          before={{ vm_power_state | default('?') }}
+          action_taken={{ action_taken | default('none') }}
+          {% if operation_mode == 'idle_check' %}
+          cpu_avg={{ '%.2f' | format((cpu_avg | default(0)) | float) }}%
+          net_total={{ net_total | default(0) }}B
+          idle={{ is_idle | default(false) }}
+          {% endif %}

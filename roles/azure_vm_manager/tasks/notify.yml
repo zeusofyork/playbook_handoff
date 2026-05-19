@@ -1,0 +1,23 @@
+---
+# Generic JSON POST. Works for Slack incoming webhooks, Teams workflows, and
+# any webhook receiver. For ServiceNow REST inbound, swap the body for the
+# expected schema.
+
+- name: "Send webhook notification"
+  ansible.builtin.uri:
+    url: "{{ notify_webhook_url }}"
+    method: POST
+    body_format: json
+    body:
+      text: >-
+        :azure: *Azure VM {{ notify_event }}*
+        `{{ vm_name }}` (rg=`{{ resource_group }}`, loc=`{{ vm_location }}`)
+        {% if operation_mode == 'idle_check' %}
+        cpu_avg=*{{ '%.2f' | format(cpu_avg | float) }}%*
+        net_total=*{{ net_total }}B*
+        window=*{{ idle_window_minutes }}m*
+        {% endif %}
+    status_code: [200, 201, 202, 204]
+    timeout: 10
+  delegate_to: localhost
+  ignore_errors: true

@@ -1,0 +1,16 @@
+---
+galaxy_info:
+  role_name: azure_vm_manager
+  author: Arcus Forge
+  description: Allocate / deallocate Azure VMs on schedule or on idle
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Any
+      versions: [all]
+  galaxy_tags:
+    - azure
+    - cloud
+    - cost
+    - automation
+dependencies: []

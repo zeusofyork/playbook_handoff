@@ -1,0 +1,169 @@
+---
+# Idle detection via Azure Monitor REST API.
+#
+# Signals:
+#   1) Percentage CPU      (Average, %)    < idle_cpu_threshold_percent
+#   2) Network In + Out    (Total, bytes)  < idle_network_threshold_bytes
+#   3) (Optional) Disk IO  (Total, bytes)  < idle_disk_io_threshold_bytes
+#
+# Guard rails:
+#   - VM not running              skip
+#   - VM came up mid-window       skip (uptime guard via data-point count)
+#   - Metric API returned no data skip (don't deallocate on missing data!)
+#   - notify_only=true            evaluate, report, never deallocate
+#   - dry_run=true                run the dealloc call in check_mode
+
+- name: "[idle] Short-circuit when VM is not running"
+  when: vm_power_state != 'running'
+  block:
+    - name: "[idle] Mark host as skipped"
+      ansible.builtin.set_fact:
+        action_taken: "skipped_not_running"
+        is_idle: false
+    - name: "[idle] End host"
+      ansible.builtin.meta: end_host
+
+- name: "[idle] Acquire ARM token (cached after first call)"
+  ansible.builtin.include_tasks: get_token.yml
+  when: hostvars['localhost']['azure_bearer_token'] is not defined
+        and azure_bearer_token is not defined
+
+# CPU + Network metrics
+- name: "[idle] Query CPU + Network metrics"
+  ansible.builtin.uri:
+    url: >-
+      https://management.azure.com{{ vm_resource_id }}/providers/Microsoft.Insights/metrics?api-version=2018-01-01&metricnames=Percentage%20CPU,Network%20In%20Total,Network%20Out%20Total&aggregation=Average,Total&timespan=PT{{ idle_window_minutes }}M&interval=PT5M
+    method: GET
+    headers:
+      Authorization: "Bearer {{ azure_bearer_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  delegate_to: localhost
+  register: metric_response
+  retries: 2
+  delay: 5
+  until: metric_response is succeeded
+
+- name: "[idle] Extract metric data points"
+  ansible.builtin.set_fact:
+    cpu_points: >-
+      {{ (metric_response.json.value
+          | selectattr('name.value','equalto','Percentage CPU')
+          | list | first).timeseries
+          | map(attribute='data') | flatten
+          | selectattr('average','defined')
+          | map(attribute='average') | list }}
+    netin_points: >-
+      {{ (metric_response.json.value
+          | selectattr('name.value','equalto','Network In Total')
+          | list | first).timeseries
+          | map(attribute='data') | flatten
+          | selectattr('total','defined')
+          | map(attribute='total') | list }}
+    netout_points: >-
+      {{ (metric_response.json.value
+          | selectattr('name.value','equalto','Network Out Total')
+          | list | first).timeseries
+          | map(attribute='data') | flatten
+          | selectattr('total','defined')
+          | map(attribute='total') | list }}
+
+- name: "[idle] Compute aggregates"
+  ansible.builtin.set_fact:
+    cpu_avg: >-
+      {{ ((cpu_points | sum) / (cpu_points | length))
+         if (cpu_points | length) > 0 else 0 }}
+    net_total: "{{ (netin_points | sum) + (netout_points | sum) }}"
+    expected_points: "{{ (idle_window_minutes | int) // 5 }}"
+    actual_cpu_points: "{{ cpu_points | length }}"
+
+# Uptime guard: PT60M @ PT5M = 12 expected points. If we got less than 80% the
+# VM was down or starting partway through the window, so refuse to deallocate.
+- name: "[idle] Uptime guard"
+  ansible.builtin.set_fact:
+    uptime_ok: >-
+      {{ (actual_cpu_points | int) >= ((expected_points | int) * 0.8) | round(0, 'floor') | int }}
+
+# Optional disk IO gate
+- name: "[idle] Query disk IO metrics (optional)"
+  ansible.builtin.uri:
+    url: >-
+      https://management.azure.com{{ vm_resource_id }}/providers/Microsoft.Insights/metrics?api-version=2018-01-01&metricnames=Disk%20Read%20Bytes,Disk%20Write%20Bytes&aggregation=Total&timespan=PT{{ idle_window_minutes }}M&interval=PT5M
+    method: GET
+    headers:
+      Authorization: "Bearer {{ azure_bearer_token }}"
+    status_code: 200
+    return_content: true
+    timeout: 30
+  delegate_to: localhost
+  register: disk_metric_response
+  when: check_disk_io | bool
+
+- name: "[idle] Compute disk IO total"
+  ansible.builtin.set_fact:
+    disk_io_total: >-
+      {{ (disk_metric_response.json.value
+          | map(attribute='timeseries') | flatten
+          | map(attribute='data') | flatten
+          | selectattr('total','defined')
+          | map(attribute='total') | list | sum) }}
+  when: check_disk_io | bool
+
+- name: "[idle] Default disk IO when not checked"
+  ansible.builtin.set_fact:
+    disk_io_total: 0
+  when: not (check_disk_io | bool)
+
+# Idle decision
+- name: "[idle] Evaluate idleness"
+  ansible.builtin.set_fact:
+    is_idle: >-
+      {{ uptime_ok | bool
+         and (cpu_avg | float) < (idle_cpu_threshold_percent | float)
+         and (net_total | int) < (idle_network_threshold_bytes | int)
+         and ((not (check_disk_io | bool))
+              or (disk_io_total | int) < (idle_disk_io_threshold_bytes | int)) }}
+
+- name: "[idle] Report evaluation"
+  ansible.builtin.debug:
+    msg: >-
+      {{ vm_name }}:
+      cpu_avg={{ '%.2f' | format(cpu_avg | float) }}%
+      net_total={{ net_total }}B
+      disk_io={{ disk_io_total if (check_disk_io | bool) else 'n/a' }}
+      uptime_ok={{ uptime_ok }}
+      idle={{ is_idle }}
+      action={{ 'deallocate' if (is_idle and not notify_only) else 'none' }}
+
+# Act on idleness
+- name: "[idle] Deallocate idle VM"
+  azure.azcollection.azure_rm_virtualmachine:
+    resource_group: "{{ resource_group }}"
+    name: "{{ vm_name }}"
+    allocated: false
+    started: false
+  delegate_to: localhost
+  when:
+    - is_idle | bool
+    - not (notify_only | bool)
+  check_mode: "{{ dry_run | bool }}"
+  register: idle_dealloc_result
+  retries: 3
+  delay: 15
+  until: idle_dealloc_result is succeeded
+
+- name: "[idle] Record action taken"
+  ansible.builtin.set_fact:
+    action_taken: >-
+      {{ 'deallocated_idle' if (is_idle and not notify_only)
+         else ('would_deallocate' if (is_idle and notify_only)
+               else 'kept_running') }}
+
+- name: "[idle] Notify"
+  ansible.builtin.include_tasks: notify.yml
+  vars:
+    notify_event: "{{ action_taken }}"
+  when:
+    - notify_webhook_url | default('') | length > 0
+    - action_taken in ['deallocated_idle', 'would_deallocate']

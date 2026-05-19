@@ -1,0 +1,31 @@
+---
+- name: "[start] Already running, no-op"
+  ansible.builtin.set_fact:
+    action_taken: "skipped_already_running"
+  when: vm_power_state == 'running'
+
+- name: "[start] Allocate & power on VM"
+  azure.azcollection.azure_rm_virtualmachine:
+    resource_group: "{{ resource_group }}"
+    name: "{{ vm_name }}"
+    allocated: true
+    started: true
+  delegate_to: localhost
+  when: vm_power_state != 'running'
+  check_mode: "{{ dry_run | bool }}"
+  register: start_result
+  retries: 3
+  delay: 15
+  until: start_result is succeeded
+
+- name: "[start] Record action"
+  ansible.builtin.set_fact:
+    action_taken: "{{ 'started' if vm_power_state != 'running' else action_taken }}"
+
+- name: "[start] Notify"
+  ansible.builtin.include_tasks: notify.yml
+  vars:
+    notify_event: "started"
+  when:
+    - notify_webhook_url | default('') | length > 0
+    - action_taken == 'started'
