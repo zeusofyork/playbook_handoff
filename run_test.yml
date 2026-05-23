@@ -1,0 +1,235 @@
+---
+# diagnose_aap_connectivity.yml
+#
+# AAP 2.6+ connectivity, DNS, SSH, and environment diagnostic.
+#
+# Run TWICE: once from the failing job template config, once from the working one.
+# Use --diff or `diff` the stdout to find what differs. The delta is your root cause.
+#
+# Required extra vars:
+#   bastion_host=<bastion-fqdn>
+# Optional extra vars:
+#   bastion_port=22
+#   bastion_user=<bastion-ssh-user>
+#
+# Example local run:
+#   ansible-playbook -i inventory diagnose_aap_connectivity.yml \
+#     -l <one-failing-host> -e bastion_host=bastion.example.com
+#
+# In AAP: create a job template that points at this playbook, attach the SAME
+# credential / EE / instance group / inventory as the failing template, run it,
+# capture stdout. Then clone the template, swap to the WORKING template's
+# EE/instance-group/credential, run again, diff the two outputs.
+
+###############################################################################
+# Phase 0 :: Execution Environment introspection (the #1 root cause)
+###############################################################################
+- name: "Phase 0 :: EE / control-side introspection"
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: ansible-core, python, EE metadata
+      ansible.builtin.debug:
+        msg:
+          ansible_version: "{{ ansible_version.full }}"
+          python: "{{ ansible_playbook_python }}"
+          ee_image: "{{ lookup('env','AWX_CONTAINER_IMAGE') | default('not-running-in-EE', true) }}"
+          execution_node: "{{ lookup('env','AWX_HOST') | default('unknown', true) }}"
+          ansible_config: "{{ lookup('env','ANSIBLE_CONFIG') | default('auto-discovery', true) }}"
+          collections_paths: "{{ lookup('env','ANSIBLE_COLLECTIONS_PATHS') | default(lookup('env','ANSIBLE_COLLECTIONS_PATH'), true) }}"
+          remote_tmp: "{{ lookup('env','ANSIBLE_REMOTE_TMP') | default('default', true) }}"
+
+    - name: Effective ansible-config (changed-from-default)
+      ansible.builtin.command: ansible-config dump --only-changed
+      changed_when: false
+      register: _cfg
+
+    - name: Show effective config
+      ansible.builtin.debug:
+        var: _cfg.stdout_lines
+
+    - name: Installed collections (and versions)
+      ansible.builtin.command: ansible-galaxy collection list
+      changed_when: false
+      register: _coll
+
+    - name: Show collections
+      ansible.builtin.debug:
+        var: _coll.stdout_lines
+
+    - name: SSH client + key inventory + resolv.conf inside EE
+      ansible.builtin.shell: |
+        echo "=== ssh client version ==="
+        ssh -V 2>&1
+        echo "=== ~/.ssh listing ==="
+        ls -la ~/.ssh 2>&1 || echo "no ~/.ssh"
+        echo "=== known_hosts (first 5) ==="
+        head -n 5 ~/.ssh/known_hosts 2>/dev/null || echo "no known_hosts"
+        echo "=== /etc/resolv.conf ==="
+        cat /etc/resolv.conf 2>&1 || true
+        echo "=== /etc/hosts overrides (non-default) ==="
+        grep -vE '^\s*(#|127\.|::1|$)' /etc/hosts || echo "no overrides"
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: _ssh_env
+
+    - name: Show SSH/DNS environment
+      ansible.builtin.debug:
+        var: _ssh_env.stdout_lines
+
+###############################################################################
+# Phase 1 :: DNS resolution from the EE
+###############################################################################
+- name: "Phase 1 :: DNS resolution from EE"
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Forward-resolve target
+      ansible.builtin.command: "getent ahostsv4 {{ ansible_host | default(inventory_hostname) }}"
+      delegate_to: localhost
+      register: _dns_target
+      failed_when: false
+      changed_when: false
+
+    - name: Forward-resolve bastion
+      ansible.builtin.command: "getent ahostsv4 {{ bastion_host }}"
+      delegate_to: localhost
+      register: _dns_bastion
+      failed_when: false
+      changed_when: false
+      when: bastion_host is defined
+
+    - name: DNS summary
+      ansible.builtin.debug:
+        msg:
+          target_host: "{{ ansible_host | default(inventory_hostname) }}"
+          target_resolves: "{{ _dns_target.rc == 0 }}"
+          target_addrs: "{{ _dns_target.stdout_lines | default(['NXDOMAIN']) }}"
+          bastion_resolves: "{{ (_dns_bastion.rc | default(1)) == 0 }}"
+          bastion_addrs: "{{ _dns_bastion.stdout_lines | default(['skipped/NXDOMAIN']) }}"
+
+###############################################################################
+# Phase 2 :: TCP reachability (firewall path)
+###############################################################################
+- name: "Phase 2 :: TCP reachability from EE"
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: TCP probe bastion:port
+      ansible.builtin.wait_for:
+        host: "{{ bastion_host }}"
+        port: "{{ bastion_port | default(22) }}"
+        timeout: 5
+        state: started
+      delegate_to: localhost
+      register: _tcp_bastion
+      ignore_errors: true
+      when: bastion_host is defined
+
+    - name: TCP probe target directly (expect failure if bastion-only)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ ansible_port | default(22) }}"
+        timeout: 5
+        state: started
+      delegate_to: localhost
+      register: _tcp_direct
+      ignore_errors: true
+
+    - name: Reachability summary
+      ansible.builtin.debug:
+        msg:
+          bastion: "{{ 'REACHABLE' if (_tcp_bastion is success) else 'BLOCKED: ' ~ (_tcp_bastion.msg | default('skipped (bastion_host not set)')) }}"
+          target_direct: "{{ 'REACHABLE' if (_tcp_direct is success) else 'BLOCKED (expected if bastion-only): ' ~ (_tcp_direct.msg | default('n/a')) }}"
+
+###############################################################################
+# Phase 3 :: SSH handshake using the exact args Ansible would use
+###############################################################################
+- name: "Phase 3 :: Raw SSH handshake via configured ProxyCommand/ProxyJump"
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Verbose ssh -vvv handshake (separates SSH from Ansible)
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          ssh -vvv \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile=/tmp/diag_known_hosts \
+              {{ ansible_ssh_common_args | default('') }} \
+              {{ ansible_ssh_extra_args | default('') }} \
+              -p {{ ansible_port | default(22) }} \
+              {{ ansible_user | default(lookup('env','USER')) }}@{{ ansible_host | default(inventory_hostname) }} \
+              'echo CONNECTED_OK; uname -a; id' 2>&1 | tail -n 120
+        executable: /bin/bash
+      delegate_to: localhost
+      register: _ssh
+      failed_when: false
+      changed_when: false
+
+    - name: SSH handshake (last 120 lines of -vvv)
+      ansible.builtin.debug:
+        var: _ssh.stdout_lines
+
+    - name: SSH verdict
+      ansible.builtin.debug:
+        msg: "{{ 'SSH OK' if 'CONNECTED_OK' in (_ssh.stdout | default('')) else 'SSH FAIL — inspect handshake above' }}"
+
+###############################################################################
+# Phase 4 :: Ansible's actual connection plugin (the real test)
+###############################################################################
+- name: "Phase 4 :: ansible.builtin.ping via Ansible's connection plugin"
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: ping (exercises ssh plugin + python discovery)
+      ansible.builtin.ping:
+      register: _ping
+      failed_when: false
+
+    - name: Ping verdict + discovered interpreter
+      ansible.builtin.debug:
+        msg:
+          ping: "{{ _ping.ping | default('FAIL') }}"
+          error: "{{ _ping.msg | default('') }}"
+          discovered_python: "{{ ansible_facts.discovered_interpreter_python | default('not yet discovered') }}"
+
+###############################################################################
+# Phase 5 :: Module / collection sanity (2.15 -> 2.16 module behavior delta)
+###############################################################################
+- name: "Phase 5 :: Module sanity check (catches collection/version drift)"
+  hosts: all
+  gather_facts: true
+  gather_subset: ['min']
+  tasks:
+    - name: Facts came back correctly (proves setup module works)
+      ansible.builtin.debug:
+        msg:
+          target_distribution: "{{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+          target_python: "{{ ansible_facts.python.version.major }}.{{ ansible_facts.python.version.minor }}"
+          control_ansible_core: "{{ ansible_version.full }}"
+
+    - name: Basic stat (file module — always present)
+      ansible.builtin.stat:
+        path: /etc/hostname
+      register: _stat
+
+    - name: Stat verdict
+      ansible.builtin.debug:
+        msg: "stat /etc/hostname exists={{ _stat.stat.exists }}"
+
+    - name: Try ansible.posix.firewalld_info (FQCN that requires collection install)
+      block:
+        - ansible.posix.firewalld_info:
+          register: _fw
+          when: ansible_facts.os_family | lower == 'redhat'
+        - ansible.builtin.debug:
+            msg: "ansible.posix.firewalld_info loaded OK"
+          when: ansible_facts.os_family | lower == 'redhat'
+      rescue:
+        - ansible.builtin.debug:
+            msg: "ansible.posix module load FAILED: {{ ansible_failed_result.msg | default('unknown') }}"
