@@ -1,0 +1,111 @@
+---
+# =============================================================================
+# Azure VM Power Management - AAP 2.6
+# =============================================================================
+# One playbook. Survey picks the action. Inventory (selected at job launch
+# or set on the template) provides the hosts via Azure dynamic inventory.
+# Schedules just set 'action' and optionally 'target_hosts' in extra_vars.
+# =============================================================================
+
+- name: Manage Azure VM Power State
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  connection: local
+  collections:
+    - azure.azcollection
+
+  vars:
+    vm_action: "{{ action | default('status') }}"
+
+  pre_tasks:
+    - name: Validate action
+      ansible.builtin.assert:
+        that: vm_action in ['start', 'deallocate', 'restart', 'status']
+        fail_msg: "Invalid action '{{ vm_action }}'. Must be: start, deallocate, restart, status"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Validate Azure inventory vars on host
+      ansible.builtin.assert:
+        that:
+          - resource_group is defined
+          - (name is defined) or (inventory_hostname_short is defined)
+        fail_msg: >-
+          Host {{ inventory_hostname }} missing required Azure inventory vars.
+          Check your dynamic inventory plugin config.
+      when: vm_action != 'status'
+
+  tasks:
+    - name: Get current VM power state
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ name | default(inventory_hostname_short | default(inventory_hostname)) }}"
+      register: vm_info
+      delegate_to: localhost
+
+    - name: Set current state fact
+      ansible.builtin.set_fact:
+        current_power_state: >-
+          {{ (vm_info.vms[0].power_state | default('unknown'))
+             if (vm_info.vms | length > 0) else 'not_found' }}
+
+    - name: Show current state
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ current_power_state }} → action: {{ vm_action }}"
+
+    - name: Start (allocate) VM
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ name | default(inventory_hostname_short | default(inventory_hostname)) }}"
+        started: true
+        allocated: true
+      delegate_to: localhost
+      when:
+        - vm_action == 'start'
+        - current_power_state != 'running'
+      register: start_result
+      retries: 3
+      delay: 15
+      until: start_result is succeeded
+
+    - name: Deallocate VM
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ name | default(inventory_hostname_short | default(inventory_hostname)) }}"
+        allocated: false
+      delegate_to: localhost
+      when:
+        - vm_action == 'deallocate'
+        - current_power_state != 'deallocated'
+      register: deallocate_result
+      retries: 3
+      delay: 15
+      until: deallocate_result is succeeded
+
+    - name: Restart VM
+      azure.azcollection.azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ name | default(inventory_hostname_short | default(inventory_hostname)) }}"
+        restarted: true
+      delegate_to: localhost
+      when:
+        - vm_action == 'restart'
+        - current_power_state == 'running'
+
+  post_tasks:
+    - name: Verify final state
+      azure.azcollection.azure_rm_virtualmachine_info:
+        resource_group: "{{ resource_group }}"
+        name: "{{ name | default(inventory_hostname_short | default(inventory_hostname)) }}"
+      register: vm_final
+      delegate_to: localhost
+      when: vm_action != 'status'
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} |
+          action={{ vm_action }} |
+          before={{ current_power_state }} |
+          after={{ vm_final.vms[0].power_state | default(current_powe
+          r_state) }}
