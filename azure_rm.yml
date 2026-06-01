@@ -1,0 +1,29 @@
+---
+# Dynamic Azure inventory: every VM in the subscription becomes a host.
+# In AAP, point an Inventory Source at this file; on the CLI, ansible-runner
+# loads it automatically. Select which servers to act on via --limit / the
+# AAP "Limit" field, or by the auto-generated rg_<name> / powerstate_<state>
+# groups below.
+plugin: azure.azcollection.azure_rm
+# 'auto' uses AZURE_* env vars (the service principal) when present, and falls
+# back to the az CLI session otherwise. AAP injects the SP as AZURE_* env vars.
+auth_source: auto
+
+# Discover VMs across all resource groups.
+include_vm_resource_groups:
+  - "*"
+
+# Use the bare VM name as the Ansible host name (e.g. "vmlab01").
+plain_host_names: true
+
+# Put every discovered VM into one predictable group the playbooks target.
+conditional_groups:
+  azure_vms: true
+
+# Handy selection groups, e.g. --limit rg_rg_ansible_vmlab  or  powerstate_running
+# (resource_group and powerstate are provided as host variables by default.)
+keyed_groups:
+  - prefix: rg
+    key: resource_group
+  - prefix: powerstate
+    key: powerstate
