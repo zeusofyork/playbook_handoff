@@ -1,0 +1,120 @@
+---
+# ===========================================================================
+# azure_vm_lifecycle.yml — SINGLE playbook: allocate, deallocate, or schedule.
+#
+# Survey-driven flow (one Job Template):
+#   1. selected_hosts : multiselect — WHICH VMs to act on (from the survey)
+#   2. vm_action      : start | deallocate | status
+#   3. run_mode       : adhoc | schedule   (run now, or set up a schedule)
+#   4. schedule_name / schedule_rrule : used only when run_mode=schedule
+#
+# Host selection comes from the survey multiselect `selected_hosts`. If it is
+# empty, all VMs in the `azure_vms` group are targeted. Each VM's resource
+# group is read from the dynamic inventory (hostvars[<vm>].resource_group),
+# so no per-host config is needed.
+#
+# NOTE on the multiselect: AAP survey choices are STATIC. Keep survey.json's
+# `selected_hosts` choices in sync with the inventory (by hand, or via a small
+# job that PATCHes the survey_spec from /api/v2/inventories/<id>/hosts/).
+#
+# Attach BOTH credentials to the Job Template:
+#   - "Microsoft Azure Resource Manager"   (azure_rm tasks)
+#   - "Red Hat Ansible Automation Platform" (schedule task; schedule mode only)
+# ===========================================================================
+- name: Azure VM lifecycle — allocate / deallocate / schedule
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vm_action: "{{ vm_action | default('status') }}"
+    run_mode: "{{ run_mode | default('adhoc') }}"
+    # Survey multiselect (list of VM names). Empty -> all discovered VMs.
+    selected_hosts: "{{ selected_hosts | default([]) }}"
+    # Resolve final target list.
+    target_vms: "{{ selected_hosts if (selected_hosts | length > 0) else (groups['azure_vms'] | default([])) }}"
+    # Schedule self-references this same job template.
+    schedule_target_jt: "{{ executor_job_template | default(awx_job_template_name | default('Azure VM Lifecycle')) }}"
+
+  tasks:
+
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - vm_action in ['start', 'deallocate', 'status']
+          - run_mode in ['adhoc', 'schedule']
+          - target_vms | length > 0
+        fail_msg: >-
+          Need at least one host (selected_hosts or a populated azure_vms group),
+          vm_action in start|deallocate|status, run_mode in adhoc|schedule.
+
+    - name: Show what will happen
+      ansible.builtin.debug:
+        msg: "mode={{ run_mode }} action={{ vm_action }} hosts={{ target_vms }}"
+
+    # ----------------------------------------------------------- AD-HOC actions
+    - name: "Deallocate selected VMs (stop compute billing)"
+      azure.azcollection.azure_rm_virtualmachine:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ hostvars[item].resource_group }}"
+        name: "{{ item }}"
+        allocated: false
+      loop: "{{ target_vms }}"
+      when:
+        - run_mode == 'adhoc'
+        - vm_action == 'deallocate'
+
+    - name: "Allocate and start selected VMs"
+      azure.azcollection.azure_rm_virtualmachine:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ hostvars[item].resource_group }}"
+        name: "{{ item }}"
+        allocated: true
+        started: true
+      loop: "{{ target_vms }}"
+      when:
+        - run_mode == 'adhoc'
+        - vm_action == 'start'
+
+    - name: "Query power state of selected VMs"
+      azure.azcollection.azure_rm_virtualmachine_info:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ hostvars[item].resource_group }}"
+        name: "{{ item }}"
+      loop: "{{ target_vms }}"
+      when: run_mode == 'adhoc'
+      register: vm_info
+
+    - name: Report power state per VM
+      ansible.builtin.debug:
+        msg: "{{ item.item }} -> power_state={{ (item.vms | first).power_state | default('unknown') }}"
+      loop: "{{ vm_info.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - run_mode == 'adhoc'
+        - vm_info is defined
+
+    # ----------------------------------------------------------- SCHEDULE (once)
+    # Creates an AAP Schedule that re-runs THIS job template in adhoc mode
+    # against exactly the hosts you selected.
+    - name: "Create/Update AAP Schedule '{{ schedule_name | default('') }}'"
+      ansible.controller.schedule:
+        name: "{{ schedule_name }}"
+        unified_job_template: "{{ schedule_target_jt }}"
+        rrule: "{{ schedule_rrule }}"
+        description: "Auto: {{ vm_action }} on {{ target_vms }}"
+        extra_data:
+          vm_action: "{{ vm_action }}"
+          run_mode: adhoc
+          selected_hosts: "{{ target_vms }}"
+        enabled: true
+        state: present
+      when: run_mode == 'schedule'
+
+    - name: Report schedule created
+      ansible.builtin.debug:
+        msg: >-
+          Schedule '{{ schedule_name }}' on '{{ schedule_target_jt }}' will run
+          '{{ vm_action }}' for {{ target_vms }} per rrule: {{ schedule_rrule }}
+      when: run_mode == 'schedule'
