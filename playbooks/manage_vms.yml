@@ -31,10 +31,10 @@
     - name: Validate operation_mode
       ansible.builtin.assert:
         that:
-          - operation_mode in ['start', 'stop', 'idle_check']
+          - operation_mode in ['start', 'stop', 'idle_check', 'schedule']
         fail_msg: >-
           operation_mode='{{ operation_mode | default('<undef>') }}' is invalid.
-          Must be one of: start, stop, idle_check.
+          Must be one of: start, stop, idle_check, schedule.
       run_once: true
       delegate_to: localhost
 
@@ -66,4 +66,7 @@
           cpu_avg={{ '%.2f' | format((cpu_avg | default(0)) | float) }}%
           net_total={{ net_total | default(0) }}B
           idle={{ is_idle | default(false) }}
+          {% elif operation_mode == 'schedule' %}
+          desired={{ 'running' if (sched_desired_running | default(false) | bool) else 'deallocated' }}
+          window=[{{ sched_window_label | default('?') }}]
           {% endif %}

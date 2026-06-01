@@ -1,6 +1,8 @@
 # Azure VM Scheduler / Idle Reaper
 
-Ansible role + playbook to allocate, deallocate, and auto-reap idle Azure VMs. Runs on demand or off AAP/AWX schedules.
+Ansible role + playbooks to allocate, deallocate, schedule, and auto-reap idle Azure VMs. Runs on demand or off AAP/AWX schedules.
+
+> **Just want to allocate / deallocate / schedule?** Use the runbook: [`azure_vm_runbook.yml`](#runbook-allocate--deallocate--schedule). It exposes those three actions directly. The rest of this README covers the underlying role and the idle-reaper.
 
 ## Why
 
@@ -8,11 +10,12 @@ Azure's built-in auto-shutdown (`Microsoft.DevTestLab/schedules`) is purely sche
 
 ## Modes
 
-| Mode | What it does |
-|------|--------------|
-| `start` | Allocate + power on. Idempotent, skips already-running VMs. |
-| `stop` | Deallocate (releases compute, stops compute billing). Skips already-deallocated VMs. |
-| `idle_check` | Queries Azure Monitor for CPU + network (and optionally disk IO), checks against thresholds, deallocates if idle for the full window. |
+| Mode | Runbook action | What it does |
+|------|----------------|--------------|
+| `start` | `allocate` | Allocate + power on. Idempotent, skips already-running VMs. |
+| `stop` | `deallocate` | Deallocate (releases compute, stops compute billing). Skips already-deallocated VMs. |
+| `schedule` | `schedule` | Reconciles each VM to a recurring weekly window: allocates inside business hours, deallocates outside them. DST-correct. See [Schedule mode](#schedule-mode). |
+| `idle_check` | — | Queries Azure Monitor for CPU + network (and optionally disk IO), checks against thresholds, deallocates if idle for the full window. |
 
 Note: deallocate is not the same as "stop". A stopped VM still bills for compute. This role always deallocates.
 
@@ -22,9 +25,10 @@ Note: deallocate is not the same as "stop". A stopped VM still bills for compute
 .
 ├── ansible.cfg
 ├── requirements.yml
+├── azure_vm_runbook.yml            # runbook: allocate | deallocate | schedule
 ├── inventory/azure_rm.yml          # dynamic inventory, all VMs in sub
-├── group_vars/all.yml              # tunables (thresholds, tags, auth)
-├── playbooks/manage_vms.yml        # entry point
+├── group_vars/all.yml              # tunables (thresholds, schedule, tags, auth)
+├── playbooks/manage_vms.yml        # role entry point (start/stop/schedule/idle_check)
 └── roles/azure_vm_manager/
     ├── defaults/main.yml
     ├── meta/main.yml
@@ -32,6 +36,7 @@ Note: deallocate is not the same as "stop". A stopped VM still bills for compute
         ├── main.yml                # dispatcher
         ├── start.yml
         ├── stop.yml
+        ├── schedule.yml            # weekly-window allocate/deallocate decision
         ├── idle_check.yml          # Azure Monitor query + decision
         ├── get_token.yml           # SP or MSI bearer token
         └── notify.yml              # webhook hook
@@ -71,6 +76,68 @@ AutoStopExclude = <any value>
 
 If you'd rather not bother with the opt-in tag, set `autostop_tag_key: ""` in `group_vars/all.yml` and the role will run against everything in `target_hosts`.
 
+## Runbook: allocate / deallocate / schedule
+
+`azure_vm_runbook.yml` is the front door for the three lifecycle actions. Pick the action with `-e action=...`:
+
+```bash
+# Allocate (start) one VM on demand
+ansible-playbook azure_vm_runbook.yml -e action=allocate -e target_hosts=jumphost-prod-01
+
+# Deallocate a whole resource group (releases compute, stops compute billing)
+ansible-playbook azure_vm_runbook.yml -e action=deallocate -e target_hosts=rg_dev_eastus
+
+# Schedule sweep: reconcile every AutoSchedule=true VM to its window.
+# Run this on a cron / AAP schedule (every 15–30 min).
+ansible-playbook azure_vm_runbook.yml -e action=schedule
+
+# Preview a schedule sweep without changing anything
+ansible-playbook azure_vm_runbook.yml -e action=schedule -e notify_only=true
+```
+
+| `action` | Effect | Host gating |
+|----------|--------|-------------|
+| `allocate` | Allocate + power on | exclusion tag only (you choose hosts via `target_hosts`) |
+| `deallocate` | Deallocate | exclusion tag only |
+| `schedule` | Reconcile to the weekly window | exclusion tag **and** opt-in `AutoSchedule=true` |
+
+All three honor `dry_run` (runs the ARM call in check_mode) and the `AutoStopExclude` hard opt-out. `schedule` also honors `notify_only` (evaluate + report, never change state).
+
+The runbook is a thin wrapper over the `azure_vm_manager` role, so `playbooks/manage_vms.yml -e operation_mode=schedule` does the same thing if you prefer the role's native verbs.
+
+## Schedule mode
+
+Schedule mode answers "should this VM be running *right now*?" from a recurring weekly window, then reconciles to it — allocate inside the window, deallocate outside it. Unlike Azure's DevTestLab auto-shutdown it can also **start** VMs, and unlike a plain cron it makes an idempotent decision every run (so a missed run self-heals on the next one).
+
+**DST-correct.** The decision reads the current weekday + time *in the target timezone* (`TZ=… date`) rather than doing fixed UTC-offset math, so the window automatically follows daylight-saving changes. Set `schedule_timezone` to the business's timezone (e.g. `America/New_York`), not UTC, if you want that behavior.
+
+### Defaults (`group_vars/all.yml`)
+
+```yaml
+schedule_tag_key: "AutoSchedule"   # opt-in tag; "" = every host in target_hosts
+schedule_tag_value: "true"
+schedule_timezone: "UTC"
+schedule_business_start: "08:00"   # allocate at/after this local time
+schedule_business_end:   "18:00"   # deallocate at/after this local time
+schedule_business_days:  "1-5"     # ISO weekdays 1=Mon..7=Sun ("1-5" or "1,2,3,4,5")
+```
+
+### Per-VM overrides (tags)
+
+Any VM can override the global window with tags. Most-specific wins:
+
+| Tag | Example | Meaning |
+|-----|---------|---------|
+| `AutoSchedule` | `true` | Opt in to scheduling (required unless `schedule_tag_key` is `""`) |
+| `ScheduleStart` | `08:00` | Local start of the running window |
+| `ScheduleStop` | `18:00` | Local end of the running window |
+| `ScheduleDays` | `1-5` | Days the window opens (ISO; range or CSV) |
+| `ScheduleTZ` | `America/New_York` | Timezone the times are interpreted in |
+
+**Overnight windows** are supported: set `ScheduleStop` earlier than `ScheduleStart` (e.g. `20:00`→`06:00`) to keep a VM up across midnight. `ScheduleDays` then refers to the day the window *opens*; the early-morning tail is governed by the previous day's membership. `start == stop` means "never run".
+
+Because the decision is recomputed every run, **how often you schedule the sweep is your resolution** — run it every 15–30 min so a VM comes up within that of its start time. See the AAP table below for a ready-to-go job template.
+
 ## Usage
 
 ### CLI
@@ -101,11 +168,14 @@ ansible-playbook playbooks/manage_vms.yml \
 
 Three job templates against this project, all using the **Microsoft Azure Resource Manager** credential type:
 
-| Job Template | Extra vars | Survey | Schedule |
-|--------------|------------|--------|----------|
-| `azure-vm-start` | `operation_mode: start` | `target_hosts` (text) | none, on demand |
-| `azure-vm-stop` | `operation_mode: stop` | `target_hosts` (text, default `tag_AutoStop_true`) | cron, nights/weekends |
-| `azure-vm-idle-reaper` | `operation_mode: idle_check` | see below | cron, every 30 min |
+| Job Template | Playbook | Extra vars | Survey | Schedule |
+|--------------|----------|------------|--------|----------|
+| `azure-vm-allocate` | `azure_vm_runbook.yml` | `action: allocate` | `target_hosts` (text) | none, on demand |
+| `azure-vm-deallocate` | `azure_vm_runbook.yml` | `action: deallocate` | `target_hosts` (text, default `tag_AutoStop_true`) | cron, nights/weekends |
+| `azure-vm-scheduler` | `azure_vm_runbook.yml` | `action: schedule` | `notify_only` (bool, default false) | cron, every 15–30 min |
+| `azure-vm-idle-reaper` | `playbooks/manage_vms.yml` | `operation_mode: idle_check` | see below | cron, every 30 min |
+
+The `azure-vm-scheduler` template lets the per-VM `Schedule*` tags (and the `schedule_*` defaults) decide allocate-vs-deallocate, so a single recurring schedule covers an entire mixed fleet. Tag VMs that should never be auto-scheduled with `AutoStopExclude`, and opt the rest in with `AutoSchedule=true`.
 
 Point AAP's inventory source at `azure_rm.yml` from this repo. On AAP 2.6, keep `cache_timeout: 300` low so newly-tagged VMs show up on the next run.
 

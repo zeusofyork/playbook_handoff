@@ -1,0 +1,102 @@
+---
+# =============================================================================
+# Azure VM Allocation Runbook
+# =============================================================================
+# One runbook, three actions, driven by the `action` extra var:
+#
+#   allocate     Allocate + power on the target VM(s).        (idempotent)
+#   deallocate   Deallocate the target VM(s) — releases compute, stops
+#                compute billing.                              (idempotent)
+#   schedule     Reconcile each VM to a recurring weekly window: allocate
+#                inside business hours, deallocate outside them. DST-correct.
+#
+# It is a thin, friendly wrapper over the azure_vm_manager role (which also
+# powers playbooks/manage_vms.yml). `allocate`/`deallocate` map to the role's
+# start/stop handlers; `schedule` maps to the role's schedule handler.
+#
+# Hosts come from the Azure dynamic inventory (inventory/azure_rm.yml); every
+# task runs on localhost and talks to the ARM API, so no SSH to the VMs.
+#
+# -----------------------------------------------------------------------------
+# Examples
+# -----------------------------------------------------------------------------
+#   # Allocate one VM on demand:
+#   ansible-playbook azure_vm_runbook.yml \
+#     -e action=allocate -e target_hosts=jumphost-prod-01
+#
+#   # Deallocate a whole resource group:
+#   ansible-playbook azure_vm_runbook.yml \
+#     -e action=deallocate -e target_hosts=rg_dev_eastus
+#
+#   # Schedule sweep (run on a cron/AAP schedule, e.g. every 15-30 min).
+#   # Only touches VMs tagged AutoSchedule=true; honors per-VM Schedule* tags:
+#   ansible-playbook azure_vm_runbook.yml -e action=schedule
+#
+#   # Preview a schedule sweep without changing anything:
+#   ansible-playbook azure_vm_runbook.yml -e action=schedule -e notify_only=true
+#
+#   # Dry-run (runs the alloc/dealloc call in check_mode):
+#   ansible-playbook azure_vm_runbook.yml -e action=deallocate \
+#     -e target_hosts=buildagent-07 -e dry_run=true
+# =============================================================================
+
+- name: Azure VM allocation runbook
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  serial: "{{ parallel_forks | default(25) }}"
+  any_errors_fatal: false
+
+  vars:
+    # User-facing verb. Maps to the role's operation_mode below.
+    action: "{{ action | default('schedule') }}"
+    _action_map:
+      allocate: start
+      deallocate: stop
+      schedule: schedule
+    operation_mode: "{{ _action_map[action] | default('') }}"
+
+  pre_tasks:
+    - name: Validate action
+      ansible.builtin.assert:
+        that:
+          - action in ['allocate', 'deallocate', 'schedule']
+        fail_msg: >-
+          action='{{ action }}' is invalid.
+          Must be one of: allocate, deallocate, schedule.
+      run_once: true
+      delegate_to: localhost
+
+    # Hard opt-out always wins, for every action.
+    - name: Skip VMs carrying the hard-exclusion tag
+      ansible.builtin.meta: end_host
+      when:
+        - exclusion_tag_key | default('') | length > 0
+        - exclusion_tag_key in (tags | default({}))
+
+    # Automated scheduling is opt-in: only sweep VMs tagged for it. Manual
+    # allocate/deallocate runs are operator-initiated and not gated this way
+    # (you pick the hosts with target_hosts). Set schedule_tag_key: "" to
+    # schedule every host in target_hosts instead.
+    - name: Skip VMs not opted in to automated scheduling
+      ansible.builtin.meta: end_host
+      when:
+        - action == 'schedule'
+        - schedule_tag_key | default('') | length > 0
+        - (tags | default({})).get(schedule_tag_key, '') | lower
+            != (schedule_tag_value | lower)
+
+  roles:
+    - role: azure_vm_manager
+
+  post_tasks:
+    - name: Per-host action summary
+      ansible.builtin.debug:
+        msg: >-
+          [{{ action }}] {{ inventory_hostname }}
+          rg={{ rg_name | default(resource_group | default('?')) }}
+          before={{ vm_power_state | default('?') }}
+          action_taken={{ action_taken | default('none') }}
+          {% if action == 'schedule' %}
+          desired={{ 'running' if (sched_desired_running | default(false) | bool) else 'deallocated' }}
+          window=[{{ sched_window_label | default('?') }}]
+          {% endif %}

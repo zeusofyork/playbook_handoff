@@ -7,6 +7,12 @@ operation_mode: idle_check
 dry_run: false
 notify_only: false
 
+# Schedule mode (operation_mode: schedule). Per-VM Schedule* tags override.
+schedule_timezone: "UTC"
+schedule_business_start: "08:00"
+schedule_business_end: "18:00"
+schedule_business_days: "1-5"
+
 idle_window_minutes: 60
 idle_cpu_threshold_percent: 5.0
 idle_network_threshold_bytes: 1048576

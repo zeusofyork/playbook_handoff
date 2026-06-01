@@ -1,0 +1,152 @@
+---
+# Schedule-driven reconcile: allocate inside a recurring weekly window,
+# deallocate outside it. This is the "decide from the clock" mode, as opposed
+# to idle_check which decides from Azure Monitor metrics.
+#
+#   inside the window  -> ensure allocated + running
+#   outside the window -> ensure deallocated
+#
+# The decision is DST-correct: we ask the OS for the current weekday/time in
+# the target timezone (`TZ=... date`) instead of doing fixed UTC-offset math,
+# so the window tracks daylight-saving changes automatically.
+#
+# Schedule resolution (most specific wins):
+#   1) Per-VM tags:  ScheduleStart, ScheduleStop, ScheduleDays, ScheduleTZ
+#   2) Global vars:  schedule_business_start / _end / _days / schedule_timezone
+#
+# Tag formats:
+#   ScheduleStart=08:00   ScheduleStop=18:00
+#   ScheduleDays=1-5      (or "1,2,3,4,5" — ISO weekdays, 1=Mon .. 7=Sun)
+#   ScheduleTZ=America/New_York
+#
+# Overnight windows are supported: ScheduleStop earlier than ScheduleStart
+# (e.g. start=20:00 stop=06:00) keeps the VM up across midnight. ScheduleDays
+# then refers to the day the window *opens*; the early-morning tail is governed
+# by the previous day's membership. start == stop means "never run".
+
+- name: "[schedule] Resolve effective schedule (per-VM tags override globals)"
+  ansible.builtin.set_fact:
+    sched_tz:       "{{ (tags | default({})).get('ScheduleTZ',    schedule_timezone) }}"
+    sched_start:    "{{ (tags | default({})).get('ScheduleStart', schedule_business_start) }}"
+    sched_stop:     "{{ (tags | default({})).get('ScheduleStop',  schedule_business_end) }}"
+    sched_days_raw: "{{ (tags | default({})).get('ScheduleDays',  schedule_business_days) }}"
+    sched_days: []
+
+# Accept "1-5", "1,2,3,4,5" and mixes like "1-5,7". Expand ranges into a
+# flat list of ISO weekday ints (1=Mon .. 7=Sun).
+- name: "[schedule] Expand schedule days into ISO weekday ints"
+  ansible.builtin.set_fact:
+    sched_days: >-
+      {{ sched_days
+         + ( range(_part.split('-')[0] | int, (_part.split('-')[1] | int) + 1) | list
+             if '-' in _part
+             else [ _part | int ] ) }}
+  loop: "{{ sched_days_raw | string | split(',') | map('trim') | reject('equalto', '') | list }}"
+  loop_control:
+    loop_var: _part
+
+# Single source of truth for "now". TZ-aware so DST is handled by the OS.
+# Output: "<iso-weekday> <HHMM>", e.g. "1 0830".
+- name: "[schedule] Read current weekday + HHMM in the VM's timezone"
+  ansible.builtin.command:
+    argv:
+      - date
+      - "+%u %H%M"
+  environment:
+    TZ: "{{ sched_tz }}"
+  delegate_to: localhost
+  changed_when: false
+  check_mode: false
+  register: sched_now
+  failed_when: sched_now.rc != 0 or (sched_now.stdout | trim | length) == 0
+
+# HHMM as an int is monotonic in time (hours*100 + minutes), so plain numeric
+# comparison gives correct time-of-day ordering without minute-of-day math.
+- name: "[schedule] Compute desired power state from the window"
+  vars:
+    _now_dow:    "{{ sched_now.stdout.split()[0] | int }}"
+    _now_hhmm:   "{{ sched_now.stdout.split()[1] | int }}"
+    _start_hhmm: "{{ sched_start | regex_replace('[^0-9]', '') | int }}"
+    _stop_hhmm:  "{{ sched_stop  | regex_replace('[^0-9]', '') | int }}"
+    _yday_dow:   "{{ ((_now_dow | int + 5) % 7) + 1 }}"
+    _today_on:   "{{ (_now_dow | int) in (sched_days | map('int') | list) }}"
+    _yday_on:    "{{ (_yday_dow | int) in (sched_days | map('int') | list) }}"
+    _overnight:  "{{ (_start_hhmm | int) > (_stop_hhmm | int) }}"
+  ansible.builtin.set_fact:
+    sched_desired_running: >-
+      {{
+        (
+          ( _today_on | bool
+            and (_now_hhmm | int) >= (_start_hhmm | int)
+            and (_now_hhmm | int) <  (_stop_hhmm  | int) )
+        ) if not (_overnight | bool) else (
+          ( _today_on | bool and (_now_hhmm | int) >= (_start_hhmm | int) )
+          or ( _yday_on  | bool and (_now_hhmm | int) <  (_stop_hhmm  | int) )
+        )
+      }}
+    sched_window_label: "{{ sched_start }}-{{ sched_stop }} days={{ sched_days_raw }} {{ sched_tz }}"
+
+- name: "[schedule] Report decision"
+  ansible.builtin.debug:
+    msg: >-
+      {{ vm_name }}: now={{ sched_now.stdout | trim }} ({{ sched_tz }})
+      window=[{{ sched_window_label }}]
+      desired={{ 'running' if (sched_desired_running | bool) else 'deallocated' }}
+      current={{ vm_power_state }}
+      action={{ 'reconcile' if not (notify_only | bool) else 'report-only' }}
+
+# Inside the window: allocate + power on. Idempotent, skips already-running VMs.
+- name: "[schedule] Allocate & power on (inside window)"
+  azure.azcollection.azure_rm_virtualmachine:
+    resource_group: "{{ resource_group }}"
+    name: "{{ vm_name }}"
+    allocated: true
+    started: true
+  delegate_to: localhost
+  when:
+    - sched_desired_running | bool
+    - vm_power_state != 'running'
+    - not (notify_only | bool)
+  check_mode: "{{ dry_run | bool }}"
+  register: sched_start_result
+  retries: 3
+  delay: 15
+  until: sched_start_result is succeeded
+
+# Outside the window: deallocate (releases compute, stops compute billing).
+- name: "[schedule] Deallocate (outside window)"
+  azure.azcollection.azure_rm_virtualmachine:
+    resource_group: "{{ resource_group }}"
+    name: "{{ vm_name }}"
+    allocated: false
+    started: false
+  delegate_to: localhost
+  when:
+    - not (sched_desired_running | bool)
+    - vm_power_state != 'deallocated'
+    - not (notify_only | bool)
+  check_mode: "{{ dry_run | bool }}"
+  register: sched_stop_result
+  retries: 3
+  delay: 15
+  until: sched_stop_result is succeeded
+
+- name: "[schedule] Record action taken"
+  ansible.builtin.set_fact:
+    action_taken: >-
+      {{
+        ('would_start' if (notify_only | bool) else 'started_by_schedule')
+          if (sched_desired_running | bool and vm_power_state != 'running')
+        else ('would_deallocate' if (notify_only | bool) else 'deallocated_by_schedule')
+          if (not (sched_desired_running | bool) and vm_power_state != 'deallocated')
+        else 'already_in_desired_state'
+      }}
+
+- name: "[schedule] Notify"
+  ansible.builtin.include_tasks: notify.yml
+  vars:
+    notify_event: "{{ action_taken }}"
+  when:
+    - notify_webhook_url | default('') | length > 0
+    - action_taken in ['started_by_schedule', 'deallocated_by_schedule',
+                       'would_start', 'would_deallocate']

@@ -15,6 +15,25 @@ autostop_tag_value: "true"
 # Safety hatch for prod boxes someone tagged AutoStop by mistake.
 exclusion_tag_key: "AutoStopExclude"
 
+# --- Schedule mode (operation_mode / action: schedule) -----------------------
+# Automated scheduling is opt-in: only VMs carrying this tag are reconciled to
+# the window. Leave schedule_tag_key empty to schedule every host in
+# target_hosts instead.
+schedule_tag_key: "AutoSchedule"
+schedule_tag_value: "true"
+
+# Default weekly running window, expressed in schedule_timezone local time.
+# Per-VM tags override any of these: ScheduleStart / ScheduleStop /
+# ScheduleDays / ScheduleTZ.
+#
+# The decision is DST-correct (we read the clock in schedule_timezone), so set
+# this to the business's timezone, not UTC, if you want the window to follow
+# daylight-saving shifts.
+schedule_timezone: "UTC"
+schedule_business_start: "08:00"   # allocate at/after this local time
+schedule_business_end: "18:00"     # deallocate at/after this local time
+schedule_business_days: "1-5"      # ISO weekdays 1=Mon..7=Sun; "1-5" or "1,2,3,4,5"
+
 # Idle-detection thresholds (only relevant for operation_mode: idle_check).
 #
 # Look-back window. Azure Monitor stores 1-min metrics for ~30 days at PT1M
