@@ -1,0 +1,49 @@
+{
+  "name": "Azure VM Lifecycle Survey",
+  "description": "Pick which VMs to act on, choose allocate/deallocate, then run now or on a schedule. Pairs with azure_vm_lifecycle.yml. NOTE: the 'Hosts' choices are static — keep them in sync with the inventory (by hand or via an API refresh job).",
+  "spec": [
+    {
+      "question_name": "Hosts",
+      "question_description": "Select which VM(s) to allocate/deallocate. Leave none selected to target ALL discovered VMs. (Choices are maintained here; they do not auto-refresh from the inventory.)",
+      "variable": "selected_hosts",
+      "type": "multiselect",
+      "choices": ["vmlab01"],
+      "default": "",
+      "required": false
+    },
+    {
+      "question_name": "Action",
+      "question_description": "Allocate (start), deallocate, or just report status.",
+      "variable": "vm_action",
+      "type": "multiplechoice",
+      "choices": ["start", "deallocate", "status"],
+      "default": "status",
+      "required": true
+    },
+    {
+      "question_name": "Run mode",
+      "question_description": "Run the action now (adhoc) or create a recurring AAP schedule for it.",
+      "variable": "run_mode",
+      "type": "multiplechoice",
+      "choices": ["adhoc", "schedule"],
+      "default": "adhoc",
+      "required": true
+    },
+    {
+      "question_name": "Schedule name (schedule mode)",
+      "question_description": "Name for the AAP Schedule. Only used when Run mode = schedule.",
+      "variable": "schedule_name",
+      "type": "text",
+      "default": "vmlab-deallocate-nightly",
+      "required": false
+    },
+    {
+      "question_name": "Schedule RRULE (schedule mode)",
+      "question_description": "iCal recurrence. Weekdays 19:00 UTC: 'DTSTART:20260602T190000Z RRULE:FREQ=DAILY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR'.",
+      "variable": "schedule_rrule",
+      "type": "text",
+      "default": "DTSTART:20260602T190000Z RRULE:FREQ=DAILY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR",
+      "required": false
+    }
+  ]
+}
