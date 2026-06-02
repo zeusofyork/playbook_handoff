@@ -1,0 +1,163 @@
+---
+# ===========================================================================
+# azure_vm_lifecycle.yml — SINGLE playbook: allocate, deallocate, or schedule.
+#
+# Host selection is the AAP "Limit" field (prompt on launch), applied to the
+# dynamic azure_rm inventory — so operators target whatever VMs currently
+# exist in Azure. Examples of Limit values:
+#   vmlab01                      one VM
+#   vmlab01,vmlab02              several
+#   powerstate_running           all running VMs   (auto group)
+#   rg_rg_ansible_vmlab          everything in a resource group (auto group)
+#   (blank)                      every discovered VM
+#
+# Survey supplies:
+#   vm_action      : start | deallocate | status
+#   run_mode       : adhoc | schedule
+#   schedule_name / schedule_rrule : used only when run_mode=schedule
+#
+# Attach BOTH credentials to the Job Template:
+#   - "Microsoft Azure Resource Manager"    (azure_rm tasks)
+#   - "Red Hat Ansible Automation Platform" (schedule task; schedule mode only)
+# ===========================================================================
+- name: Azure VM lifecycle — allocate / deallocate / schedule
+  # Defaults to all hosts in the chosen inventory; narrow with the Limit field.
+  # Override target_hosts if you want to pin a specific group.
+  hosts: "{{ target_hosts | default('all') }}"
+  connection: local          # azure_rm + controller modules run on the controller
+  gather_facts: false
+
+  vars:
+    vm_action: "{{ vm_action | default('status') }}"
+    run_mode: "{{ run_mode | default('adhoc') }}"
+    # The azure_rm inventory may use a composed inventory_hostname (e.g. with a
+    # disambiguation suffix). The real Azure VM name is the 'name' hostvar;
+    # fall back to inventory_hostname for plain-name inventories.
+    vm_real_name: "{{ hostvars[inventory_hostname].name | default(inventory_hostname) }}"
+    vm_rg: "{{ hostvars[inventory_hostname].resource_group | default(resource_group | default('')) }}"
+    # Schedule self-references this same job template.
+    schedule_target_jt: "{{ executor_job_template | default(awx_job_template_name | default('Azure VM Lifecycle')) }}"
+
+    # ---- Friendly schedule inputs (survey) -> iCal RRULE -------------------
+    # schedule_days : list of weekday names, e.g. ['Monday','Friday']
+    # schedule_time : 24h HHMM, e.g. '1800'
+    # schedule_timezone : IANA tz, e.g. America/New_York (handles EST/EDT)
+    schedule_days: "{{ schedule_days | default([]) }}"
+    schedule_time: "{{ schedule_time | default('1800') }}"
+    schedule_timezone: "{{ schedule_timezone | default('America/New_York') }}"
+    _day_codes:
+      Monday: MO
+      Tuesday: TU
+      Wednesday: WE
+      Thursday: TH
+      Friday: FR
+      Saturday: SA
+      Sunday: SU
+    _byday: "{{ schedule_days | map('extract', _day_codes) | join(',') }}"
+    _hhmm: "{{ schedule_time | string | replace(':', '') }}"
+    # If a raw schedule_rrule is supplied it wins; otherwise build from days/time/tz.
+    schedule_rrule_final: >-
+      {{ schedule_rrule if (schedule_rrule | default('')) else
+         'DTSTART;TZID=' ~ schedule_timezone ~ ':20260602T' ~ _hhmm[:2] ~ _hhmm[2:4] ~ '00'
+         ~ ' RRULE:FREQ=WEEKLY;BYDAY=' ~ _byday }}
+
+  tasks:
+
+    - name: Validate inputs
+      ansible.builtin.assert:
+        that:
+          - vm_action in ['start', 'deallocate', 'status']
+          - run_mode in ['adhoc', 'schedule']
+        fail_msg: "vm_action must be start|deallocate|status and run_mode must be adhoc|schedule."
+      run_once: true
+
+    # SAFETY: refuse a destructive action against the entire inventory unless an
+    # explicit Limit was set (or the operator deliberately overrides). Prevents
+    # accidentally deallocating every VM in a production inventory.
+    - name: "Safety guard — require a Limit for '{{ vm_action }}'"
+      ansible.builtin.assert:
+        that: (ansible_limit | default('') | length > 0) or (allow_all_hosts | default(false) | bool)
+        fail_msg: >-
+          Refusing to '{{ vm_action }}' with no Limit set — that would hit ALL
+          {{ ansible_play_hosts_all | length }} host(s) in this inventory. Set a
+          Limit (host name or group), or pass -e allow_all_hosts=true to override.
+      when: vm_action in ['start', 'deallocate']
+      run_once: true
+
+    # ----------------------------------------------------------- AD-HOC actions
+    - name: "Deallocate {{ vm_real_name }} (stop compute billing)"
+      azure.azcollection.azure_rm_virtualmachine:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ vm_rg }}"
+        name: "{{ vm_real_name }}"
+        allocated: false
+      when:
+        - run_mode == 'adhoc'
+        - vm_action == 'deallocate'
+
+    - name: "Allocate and start {{ vm_real_name }}"
+      azure.azcollection.azure_rm_virtualmachine:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ vm_rg }}"
+        name: "{{ vm_real_name }}"
+        allocated: true
+        started: true
+      when:
+        - run_mode == 'adhoc'
+        - vm_action == 'start'
+
+    - name: "Query power state of {{ vm_real_name }}"
+      azure.azcollection.azure_rm_virtualmachine_info:
+        auth_source: "{{ azure_auth_source | default('auto') }}"
+        resource_group: "{{ vm_rg }}"
+        name: "{{ vm_real_name }}"
+      when: run_mode == 'adhoc'
+      register: vm_info
+
+    - name: Report power state
+      ansible.builtin.debug:
+        msg: >-
+          {{ vm_real_name }} (rg={{ vm_rg }}) action='{{ vm_action }}' ->
+          power_state={{ (vm_info.vms | first).power_state | default('unknown') }}
+      when: run_mode == 'adhoc'
+
+    # ----------------------------------------------------------- SCHEDULE (once)
+    - name: Validate schedule inputs
+      ansible.builtin.assert:
+        that:
+          - schedule_name | default('') | length > 0
+          - (schedule_rrule | default('')) or (schedule_days | length > 0)
+          - (schedule_rrule | default('')) or (_hhmm | regex_search('^[0-2][0-9][0-5][0-9]$'))
+        fail_msg: >-
+          Schedule mode needs: a Schedule name, at least one Day, and a 24h Time
+          as HHMM (e.g. 1800). Got days={{ schedule_days }} time='{{ schedule_time }}'.
+      run_once: true
+      when: run_mode == 'schedule'
+
+    # Builds the schedule's Limit from exactly the hosts selected for this run,
+    # so the schedule re-runs in adhoc mode against the same VMs.
+    - name: "Create/Update AAP Schedule '{{ schedule_name | default('') }}' for selected hosts"
+      ansible.controller.schedule:
+        name: "{{ schedule_name }}"
+        unified_job_template: "{{ schedule_target_jt }}"
+        rrule: "{{ schedule_rrule_final }}"
+        description: "Auto: {{ vm_action }} on [{{ ansible_play_hosts_all | join(',') }}]"
+        extra_data:
+          vm_action: "{{ vm_action }}"
+          run_mode: adhoc
+        limit: "{{ ansible_play_hosts_all | join(',') }}"
+        enabled: true
+        state: present
+      delegate_to: localhost
+      run_once: true
+      when: run_mode == 'schedule'
+
+    - name: Report schedule created
+      ansible.builtin.debug:
+        msg: >-
+          Schedule '{{ schedule_name }}' on '{{ schedule_target_jt }}' will run
+          '{{ vm_action }}' for hosts [{{ ansible_play_hosts_all | join(',') }}]
+          on {{ schedule_days | join(', ') }} at {{ schedule_time }} {{ schedule_timezone }}
+          (rrule: {{ schedule_rrule_final | trim }})
+      run_once: true
+      when: run_mode == 'schedule'
