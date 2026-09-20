@@ -57,6 +57,74 @@ clipper queue stats
 
 Clip IDs can be abbreviated to any unique prefix.
 
+## Finding campaigns worth clipping
+
+Headline CPM is the wrong thing to sort on. Budget is pooled per campaign, not
+per clipper, so a pool that runs dry in two days is worth nothing whatever its
+rate. `clipper campaigns` pulls the public discover board, works out how fast
+each pool is draining, and ranks by what is actually left for you:
+
+```bash
+clipper campaigns list --platform tiktok --min-days 14 --no-application
+```
+
+```
+ID           CPM     LEFT   BURN/D  RUNWAY  CLIPPERS   $/CLIP  SCORE  CAMPAIGN
+efa2656a   $5.00    $2.2k      $33     67d        25      $88  0.814    Maxim Hair Restoration Campaign
+ecbd7fec   $1.00   $39.0k     $446     87d       305     $128  0.757    Lovable Clipping
+334ba2c6   $3.00    $6.7k     $226     30d       117      $57  0.714    Syberjet Speed Record
+1db63081   $1.00    $8.2k    $4.1k      2d      2941       $3  0.202    ForgeGUI Clipping [Roblox]
+```
+
+That last row is the point: $8.2k left at $1 CPM looks healthy in a table of
+budgets, and it is gone in two days.
+
+### Burn rate
+
+Two estimates, in order of preference:
+
+- **observed** — the drop in available budget between two of your own runs.
+  Recent and real, but needs at least two snapshots an hour or more apart.
+- **lifetime** — spend since funding divided by campaign age. Available on the
+  very first run, but it is an average, so it understates a pool that only just
+  got busy.
+
+Every run records a snapshot, so the estimate improves on its own. Run it from
+cron and you build the series for free.
+
+### Ranking
+
+`score` combines three components, each normalised across the board:
+
+| Component | Weight | What it measures |
+|---|---|---|
+| `runway` | 0.45 | days of budget left, flattening out at 30 |
+| `rate` | 0.25 | CPM relative to the best on the board |
+| `headroom` | 0.30 | dollars left per clipper already competing, as a percentile |
+
+Runway is weighted highest on purpose: a dead pool pays nothing at any rate.
+It is a heuristic for ordering a shortlist, not a forecast — `campaigns show`
+prints the components so you can disagree with the weighting.
+
+### Watching a campaign
+
+```bash
+clipper campaigns watch ecbd7fec
+clipper campaigns check --min-days 7     # exits 1 if a watched pool is running out
+```
+
+`check` is built for cron. Non-zero exit means a pool you are actively clipping
+is about to stop paying, or has dropped off the board entirely:
+
+```cron
+0 */6 * * * cd ~/clipping && clipper campaigns check --min-days 7 || notify-send "clipping budget low"
+```
+
+Only the public `/discover` page is fetched, never the `/api/` paths the site's
+robots.txt disallows, and responses are cached for an hour by default
+(`--refresh` to force). If the board's markup changes, parsing fails loudly with
+a non-zero exit rather than quietly reporting an empty board.
+
 ## The brief is the spec
 
 `campaign.yml` encodes the campaign's rules — duration bounds, aspect, required
@@ -91,6 +159,9 @@ chains all of them.
 | score | `clipper score` | `moments.json` (ranked, non-overlapping) |
 | render | `clipper render` | `work/clips/<id>/clip.mp4`, `captions.ass`, `caption.txt`, `POST.md` |
 | queue | `clipper queue ...` | `work/queue/ledger.json` |
+
+Campaign discovery (`clipper campaigns`) sits outside that chain and caches into
+`work/campaigns/`.
 
 A local file path works anywhere a URL does, and nothing derived from it is
 written next to your original media.
@@ -169,7 +240,11 @@ work/
 │   ├── caption.txt         # the post caption
 │   ├── meta.json           # provenance: source, timestamps, score, components
 │   └── POST.md             # pre-publish checklist
-└── queue/ledger.json       # what you posted, where, and what it earned
+├── queue/ledger.json       # what you posted, where, and what it earned
+└── campaigns/
+    ├── board.html          # cached discover page
+    ├── history.json        # budget snapshots, for observed burn rate
+    └── watch.json          # campaigns to alert on
 ```
 
 `meta.json` keeps every clip traceable back to its source and timestamps, which
@@ -178,10 +253,12 @@ is what you want when a campaign disputes a submission.
 ## Development
 
 ```bash
-make test     # 80+ unit tests, no ffmpeg or network needed
+make test     # 140+ unit tests, no ffmpeg or network needed
 make doctor
 ```
 
 The ffmpeg-dependent tests skip themselves when it isn't installed. The scoring
-math, caption chunking, brief validation, filter-graph construction and ledger
-accounting are all pure functions and tested directly.
+math, caption chunking, brief validation, filter-graph construction, board
+parsing, burn-rate estimation and ledger accounting are all pure functions and
+tested directly; the board parser runs against a committed fixture, so no test
+touches the network.

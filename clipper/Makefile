@@ -22,6 +22,12 @@ doctor:  ## check external tools
 init:  ## scaffold campaigns/example/campaign.yml
 	$(PY) -m clipper.cli init campaigns/example
 
+campaigns:  ## rank open campaigns by remaining budget
+	$(PY) -m clipper.cli --work $(WORK) campaigns list
+
+check:  ## exit non-zero if a watched campaign is running out (for cron)
+	$(PY) -m clipper.cli --work $(WORK) campaigns check --min-days 7
+
 run:  ## run the full pipeline for BRIEF
 	$(PY) -m clipper.cli --work $(WORK) run --brief $(BRIEF)
 

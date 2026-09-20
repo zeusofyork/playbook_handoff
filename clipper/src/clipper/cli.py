@@ -13,10 +13,25 @@ import json
 import logging
 import shutil
 import sys
+import textwrap
 from pathlib import Path
 
 from . import __version__
 from .brief import Brief, BriefError
+from .campaigns import (
+    BoardError,
+    BoardParseError,
+    Campaign,
+    History,
+    Watchlist,
+    enrich,
+    fetch_board,
+    filter_campaigns,
+    parse_board,
+    rank,
+    resolve,
+    to_dict,
+)
 from .fetch import fetch
 from .queue import Ledger, write_checklist
 from .render import BriefViolation, render_clip
@@ -243,6 +258,189 @@ def cmd_queue_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------------ campaigns
+
+
+def money(amount: float) -> str:
+    """Compact dollars: $67.4k, $950, $1.2M."""
+    if amount >= 1_000_000:
+        return f"${amount / 1_000_000:.1f}M"
+    if amount >= 1_000:
+        return f"${amount / 1_000:.1f}k"
+    return f"${amount:.0f}"
+
+
+def load_campaigns(args: argparse.Namespace) -> tuple[list[Campaign], History, Watchlist]:
+    """Fetch (or reuse) the board, record a snapshot, and enrich every campaign."""
+    work = Path(args.work)
+    html = fetch_board(
+        work,
+        max_age=0 if getattr(args, "refresh", False) else args.cache_seconds,
+        force=getattr(args, "refresh", False),
+    )
+    campaigns = parse_board(html)
+
+    history = History.for_work(work)
+    watchlist = Watchlist.for_work(work)
+    if not getattr(args, "no_record", False):
+        history.record(campaigns)
+        history.save()
+
+    enrich(campaigns, history)
+    return campaigns, history, watchlist
+
+
+def cmd_campaigns_list(args: argparse.Namespace) -> int:
+    campaigns, _, watchlist = load_campaigns(args)
+    selected = filter_campaigns(
+        campaigns,
+        platform=args.platform,
+        min_days=args.min_days,
+        min_budget=args.min_budget,
+        min_cpm=args.min_cpm,
+        max_creators=args.max_creators,
+        include_application=not args.no_application,
+        query=args.query,
+    )
+    ordered = rank(selected)[: args.limit]
+
+    if args.json:
+        print(json.dumps([to_dict(c) for c in ordered], indent=2))
+        return 0
+
+    if not ordered:
+        print(f"no campaigns matched (board has {len(campaigns)})")
+        return 0
+
+    print(
+        f"{'ID':<10}{'CPM':>6}{'LEFT':>9}{'BURN/D':>9}{'RUNWAY':>8}"
+        f"{'CLIPPERS':>10}{'$/CLIP':>9}{'SCORE':>7}  CAMPAIGN"
+    )
+    for campaign in ordered:
+        flags = "*" if campaign.id in watchlist.ids else " "
+        flags += "+" if campaign.requires_application else " "
+        print(
+            f"{campaign.short_id:<10}"
+            f"{'$' + format(campaign.cpm, '.2f'):>6}"
+            f"{money(campaign.budget_available):>9}"
+            f"{money(campaign.burn_per_day or 0):>9}"
+            f"{campaign.runway_label():>8}"
+            f"{campaign.creators:>10}"
+            f"{money(campaign.budget_per_creator):>9}"
+            f"{campaign.score:>7.3f}"
+            f"  {flags}{campaign.title[:44]}"
+        )
+
+    sources = {c.burn_source for c in ordered}
+    print(f"\n{len(ordered)} of {len(campaigns)} campaigns.  * watched   + application required")
+    print("Burn rate: " + "/".join(sorted(sources)) + ".")
+    if "lifetime" in sources:
+        print(
+            "  'lifetime' averages spend since funding, so it understates a pool that only"
+            " just got busy. Re-run tomorrow for an observed rate."
+        )
+    print(
+        "Score weights runway 0.45, rate 0.25, headroom 0.30."
+        " A shortlist heuristic, not a forecast - verify on the campaign page before clipping."
+    )
+    return 0
+
+
+def cmd_campaigns_show(args: argparse.Namespace) -> int:
+    campaigns, _, watchlist = load_campaigns(args)
+    campaign = resolve(campaigns, args.campaign)
+
+    if args.json:
+        print(json.dumps(to_dict(campaign), indent=2))
+        return 0
+
+    watched = " (watched)" if campaign.id in watchlist.ids else ""
+    print(f"{campaign.title}{watched}")
+    print(f"  brand         {campaign.brand or '-'}")
+    print(f"  id            {campaign.id}")
+    print(f"  experience    {campaign.experience_id or '-'}")
+    print(f"  category      {campaign.category or '-'}")
+    print(f"  platforms     {', '.join(campaign.platforms) or '-'}")
+    print(f"  verified      {campaign.verified}   application required: {campaign.requires_application}")
+    print()
+    print(f"  rate          ${campaign.cpm:.2f} per 1k views")
+    print(f"  budget        {money(campaign.budget_total)} total, "
+          f"{money(campaign.budget_spent)} spent ({campaign.spent_fraction:.0%}), "
+          f"{money(campaign.budget_available)} left")
+    print(f"  burn          {money(campaign.burn_per_day or 0)}/day ({campaign.burn_source})")
+    print(f"  runway        {campaign.runway_label()} at that rate")
+    print(f"  age           {campaign.age_days:.1f} days")
+    print()
+    print(f"  clippers      {campaign.creators}  ({campaign.submissions} submissions)")
+    print(f"  headroom      {money(campaign.budget_per_creator)} left per clipper already in")
+    print(f"  score         {campaign.score:.3f}  {campaign.components}")
+    if campaign.description:
+        print()
+        print("  brief:")
+        for line in textwrap.wrap(campaign.description, width=88):
+            print(f"    {line}")
+    print()
+    print("  Verify the budget on the campaign page before cutting - this board moves daily.")
+    return 0
+
+
+def cmd_campaigns_watch(args: argparse.Namespace) -> int:
+    campaigns, _, watchlist = load_campaigns(args)
+    campaign = resolve(campaigns, args.campaign)
+    if watchlist.add(campaign.id):
+        watchlist.save()
+        print(f"watching {campaign.short_id}  {campaign.title}")
+    else:
+        print(f"already watching {campaign.short_id}  {campaign.title}")
+    return 0
+
+
+def cmd_campaigns_unwatch(args: argparse.Namespace) -> int:
+    work = Path(args.work)
+    watchlist = Watchlist.for_work(work)
+    matches = [i for i in watchlist.ids if i.startswith(args.campaign)]
+    if not matches:
+        print(f"not watching anything matching {args.campaign!r}", file=sys.stderr)
+        return 1
+    for campaign_id in matches:
+        watchlist.remove(campaign_id)
+    watchlist.save()
+    print(f"stopped watching {', '.join(i.split('-')[0] for i in matches)}")
+    return 0
+
+
+def cmd_campaigns_check(args: argparse.Namespace) -> int:
+    """Exit non-zero when a watched campaign is running out. Built for cron."""
+    campaigns, _, watchlist = load_campaigns(args)
+    if not watchlist.ids:
+        print("nothing on the watchlist; add one with `clipper campaigns watch <id>`")
+        return 0
+
+    by_id = {c.id: c for c in campaigns}
+    alerts: list[str] = []
+    for campaign_id in watchlist.ids:
+        campaign = by_id.get(campaign_id)
+        if campaign is None:
+            alerts.append(f"{campaign_id.split('-')[0]}  GONE from the board (ended or delisted)")
+            continue
+        if (campaign.days_left or 0.0) < args.min_days:
+            alerts.append(
+                f"{campaign.short_id}  {campaign.runway_label()} left "
+                f"({money(campaign.budget_available)} at {money(campaign.burn_per_day or 0)}/day)"
+                f"  {campaign.title[:40]}"
+            )
+
+    if not alerts:
+        print(f"all {len(watchlist.ids)} watched campaign(s) above {args.min_days:g} days of runway")
+        return 0
+
+    print(f"{len(alerts)} watched campaign(s) under {args.min_days:g} days:")
+    for alert in alerts:
+        print(f"  {alert}")
+    return 1
+
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -324,6 +522,52 @@ def build_parser() -> argparse.ArgumentParser:
     q_stats = qsub.add_parser("stats", help="totals across the ledger")
     q_stats.set_defaults(func=cmd_queue_stats)
 
+    p_campaigns = sub.add_parser("campaigns", help="find campaigns with budget left")
+    csub = p_campaigns.add_subparsers(dest="campaigns_command", required=True)
+
+    def add_board_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--refresh", action="store_true", help="bypass the cached board")
+        p.add_argument(
+            "--cache-seconds", type=float, default=3600, help="reuse a board this fresh"
+        )
+        p.add_argument(
+            "--no-record", action="store_true", help="do not add a snapshot to the history"
+        )
+        p.add_argument("--json", action="store_true")
+
+    c_list = csub.add_parser("list", help="ranked board")
+    add_board_flags(c_list)
+    c_list.add_argument("--platform", help="only campaigns allowing this platform")
+    c_list.add_argument("--min-days", type=float, help="minimum days of runway")
+    c_list.add_argument("--min-budget", type=float, help="minimum dollars left")
+    c_list.add_argument("--min-cpm", type=float, help="minimum rate per 1k views")
+    c_list.add_argument("--max-creators", type=int, help="maximum clippers already competing")
+    c_list.add_argument("--no-application", action="store_true", help="skip gated campaigns")
+    c_list.add_argument("--query", help="substring of the title, brand or category")
+    c_list.add_argument("--limit", type=int, default=20)
+    c_list.set_defaults(func=cmd_campaigns_list)
+
+    c_show = csub.add_parser("show", help="one campaign in full, including its brief")
+    add_board_flags(c_show)
+    c_show.add_argument("campaign", help="campaign ID, ID prefix, or title substring")
+    c_show.set_defaults(func=cmd_campaigns_show)
+
+    c_watch = csub.add_parser("watch", help="alert when this campaign runs low")
+    add_board_flags(c_watch)
+    c_watch.add_argument("campaign")
+    c_watch.set_defaults(func=cmd_campaigns_watch)
+
+    c_unwatch = csub.add_parser("unwatch", help="stop watching a campaign")
+    c_unwatch.add_argument("campaign")
+    c_unwatch.set_defaults(func=cmd_campaigns_unwatch)
+
+    c_check = csub.add_parser(
+        "check", help="exit non-zero if a watched campaign is running out (for cron)"
+    )
+    add_board_flags(c_check)
+    c_check.add_argument("--min-days", type=float, default=7.0)
+    c_check.set_defaults(func=cmd_campaigns_check)
+
     return parser
 
 
@@ -336,6 +580,9 @@ def main(argv: list[str] | None = None) -> int:
     except BriefError as exc:
         print(f"brief error: {exc}", file=sys.stderr)
         return 2
+    except (BoardError, BoardParseError) as exc:
+        print(f"campaign board: {exc}", file=sys.stderr)
+        return 4
     except ToolMissing as exc:
         print(f"missing tool: {exc}\nRun `clipper doctor` for the full list.", file=sys.stderr)
         return 3
