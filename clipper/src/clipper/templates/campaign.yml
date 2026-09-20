@@ -1,0 +1,95 @@
+# Campaign brief: the campaign's rules, encoded so a violation fails at render
+# time instead of at submission time. Every key is optional except `name`.
+#
+# Fill this in FROM THE CAMPAIGN'S OWN BRIEF. Do not guess - an unpaid clip
+# costs more than the two minutes of reading.
+
+name: example-campaign
+
+# Source video you are LICENSED to clip: the campaign's supplied content, or
+# your own footage. A local file path works here too.
+source_urls:
+  - https://www.youtube.com/watch?v=REPLACE_ME
+
+platforms:
+  - tiktok
+  - instagram
+  - youtube
+
+# Duration bounds from the brief. target_seconds is what the scorer cuts to.
+min_seconds: 20
+target_seconds: 34
+max_seconds: 60
+
+# Output geometry. 1080x1920 is 9:16.
+width: 1080
+height: 1920
+fps: 30
+
+# crop     - fill the frame, cutting the sides off a 16:9 source
+# blur_pad - fit the full frame over a blurred copy of itself
+# none     - letterbox onto the canvas, never crop
+reframe: crop
+crop_anchor: 0.5          # 0.0 = keep the left edge, 1.0 = keep the right
+
+loudness_lufs: -14.0      # platform playback target
+video_crf: 20
+video_preset: veryfast
+audio_bitrate: 192k
+
+# Words that make a window more likely to be picked.
+keywords:
+  - REPLACE_ME
+
+# Words the brief forbids. A clip containing any of these is never rendered.
+banned_words: []
+
+max_clips_per_source: 8
+min_gap_seconds: 30       # spread picks across the source
+max_overlap: 0.25         # only applies when min_gap_seconds is 0
+skip_intro_seconds: 60    # skip the sponsor read / "welcome back"
+skip_outro_seconds: 30
+
+# Post caption. Placeholders: {hook} {hashtags} {attribution} {campaign} {preview}
+caption_template: "{hook}\n\n{attribution}\n{hashtags}"
+hashtags:
+  - "#clips"
+attribution: ""           # required credit line, if the brief demands one
+notes: ""
+
+whisper_model: small.en
+whisper_device: auto      # auto | cpu | cuda
+whisper_compute_type: int8
+
+caption_style:
+  enabled: true
+  font: DejaVu Sans
+  font_size: 76
+  margin_v: 420           # raise this if the platform UI covers your captions
+  max_chars_per_cue: 28
+  max_words_per_cue: 4
+  uppercase: true
+
+hook_style:
+  enabled: true
+  seconds: 3.0
+  font_size: 88
+  margin_v: 260
+  templates:
+    - "he said WHAT about {keyword}?"
+    - "\"{quote}\""
+    - "nobody talks about this {keyword} detail"
+
+# Relative pull of each ranking signal.
+weights:
+  energy: 1.0
+  hook_energy: 0.8
+  speech_density: 0.6
+  keyword: 1.2
+
+# Payout terms, used ONLY for queue estimates. The blended rate actually paid
+# across all tracked views tends to land far under the advertised headline.
+economics:
+  rate_per_1k_views_usd: 1.0
+  per_clip_cap_usd: 1000.0
+  min_views_to_qualify: 0
